@@ -1,0 +1,6 @@
+@MyTts_HostAddress = http://localhost:5209
+
+GET {{MyTts_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
