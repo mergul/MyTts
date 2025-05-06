@@ -9,6 +9,8 @@ using ElevenLabs.Voices;
 using Google.Cloud.Storage.V1;
 using Microsoft.Extensions.Options;
 using MyTts.Config;
+using MyTts.Services;
+using MyTts.Storage;
 using StackExchange.Redis;
 
 namespace MyTts.Data
@@ -17,43 +19,100 @@ namespace MyTts.Data
     {
         private readonly ElevenLabsClient _elevenLabsClient;
         private readonly StorageClient _storageClient;
-        private readonly IDatabase _redisDb;
+        private readonly IRedisCacheService? _cache;
         private readonly IOptions<ElevenLabsConfig> _config;
         private readonly ILogger<TtsManager> _logger;
-        private const string LocalSavePath = "audio";
+        public const string LocalSavePath = "audio";
         private readonly SemaphoreSlim _semaphore;
         private const int MaxConcurrentOperations = 3;
-        private const string TempPath = "temp";
-
+        private readonly StorageConfiguration _storageConfig;
+        private readonly string _bucketName;
 
         public TtsManager(
             ElevenLabsClient elevenLabsClient,
             IOptions<ElevenLabsConfig> config,
-            IConnectionMultiplexer redis,
+            IOptions<StorageConfiguration> storageConfig,
+            IRedisCacheService cache,
             ILogger<TtsManager> logger)
         {
             _elevenLabsClient = elevenLabsClient ?? throw new ArgumentNullException(nameof(elevenLabsClient));
             _config = config ?? throw new ArgumentNullException(nameof(config));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-            _redisDb = redis?.GetDatabase() ?? throw new ArgumentNullException(nameof(redis));
+            _cache = cache ?? throw new ArgumentNullException(nameof(cache));
             _storageClient = StorageClient.Create();
             _semaphore = new SemaphoreSlim(MaxConcurrentOperations);
+            _storageConfig = storageConfig.Value;
+            // Initialize Google Cloud Storage
+            (_storageClient, _bucketName) = InitializeGoogleCloudStorage(_storageConfig);
+
 
             Directory.CreateDirectory(LocalSavePath);
-            //Directory.CreateDirectory(TempPath);
         }
+        private (StorageClient client, string bucketName) InitializeGoogleCloudStorage(StorageConfiguration config)
+        {
+            try
+            {
+                // Get Google Cloud configuration  
+                if (!config.Disks.TryGetValue("GoogleCloud", out var googleCloudDisk))
+                {
+                    throw new InvalidOperationException("GoogleCloud disk configuration not found.");
+                }
 
-        public async Task ProcessContentsAsync(IEnumerable<string> contents, string bucketName, CancellationToken cancellationToken = default)
+                // Ensure Config is not null
+                if (googleCloudDisk.Config == null)
+                {
+                    throw new InvalidOperationException("GoogleCloud disk configuration is null.");
+                }
+
+                // Handle bucket name
+                string? bucketName = null;
+                if (!googleCloudDisk.Config.TryGetValue("BucketName", out bucketName) || string.IsNullOrEmpty(bucketName))
+                {
+                    throw new InvalidOperationException("BucketName not configured for GoogleCloud disk.");
+                }
+
+                // Create StorageClient with builder for more control  
+                var clientBuilder = new StorageClientBuilder();
+
+                // If AuthJson is provided in config, use it  
+                if (googleCloudDisk.Config.TryGetValue("AuthJson", out var authJson))
+                {
+                    clientBuilder.CredentialsPath = authJson;
+                }
+
+                var client = clientBuilder.Build();
+
+                // Verify bucket exists and is accessible  
+                try
+                {
+                    client.GetBucket(bucketName);
+                    _logger.LogInformation("Successfully connected to Google Cloud Storage bucket: {BucketName}", bucketName);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to access Google Cloud Storage bucket: {BucketName}", bucketName);
+                    throw new InvalidOperationException($"Cannot access bucket: {bucketName}", ex);
+                }
+
+                return (client, bucketName);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to initialize Google Cloud Storage client");
+                throw;
+            }
+        }
+        public async Task<string?> ProcessContentsAsync(IEnumerable<string> contents, CancellationToken cancellationToken = default)
         {
             ArgumentNullException.ThrowIfNull(contents);
-            ArgumentException.ThrowIfNullOrEmpty(bucketName);
+           // ArgumentException.ThrowIfNullOrEmpty(bucketName);
             var processedFiles = new List<string>();
             try
             {
                 var tasks = contents.Select(async content =>
                 {
                     await using var _ = await _semaphore.WaitAsyncDisposable(cancellationToken);
-                    var filePath = await ProcessContentAsync(content, Guid.NewGuid(), bucketName, cancellationToken);
+                    var filePath = await ProcessContentAsync(content, Guid.NewGuid(), cancellationToken);
                     processedFiles.Add(filePath);
                 });
 
@@ -74,6 +133,7 @@ namespace MyTts.Data
                             "Processed {Count} files. Merged file created: {MergedCreated}",
                             processedFiles.Count,
                             mergedPath != null);
+                return mergedPath;
             }
             catch (OperationCanceledException)
             {
@@ -87,7 +147,7 @@ namespace MyTts.Data
             }
         }
 
-        private async Task<string> ProcessContentAsync(string text, Guid id, string bucketName, CancellationToken cancellationToken)
+        public async Task<string> ProcessContentAsync(string text, Guid id, CancellationToken cancellationToken)
         {
             var fileName = $"speech_{id}.mp3";
             var localPath = Path.Combine(LocalSavePath, fileName);
@@ -109,8 +169,8 @@ namespace MyTts.Data
                 // Parallel operations for saving and uploading
                 await Task.WhenAll(
                     SaveLocallyAsync(audioProcessor, localPath, cancellationToken),
-                    UploadToCloudAsync(audioProcessor, bucketName, fileName, cancellationToken),
-                    StoreMetadataAsync(id, text, localPath, bucketName, fileName, cancellationToken)
+                    UploadToCloudAsync(audioProcessor, fileName, cancellationToken),
+                    StoreMetadataAsync(id, text, localPath, fileName, cancellationToken)
                 );
 
                 _logger.LogInformation("Processed content {Id}: {FileName}", id, fileName);
@@ -151,35 +211,37 @@ namespace MyTts.Data
             await processor.CopyToAsync(fileStream, cancellationToken);
         }
 
-        private async Task UploadToCloudAsync(AudioProcessor processor, string bucketName, string fileName, CancellationToken cancellationToken)
+        private async Task UploadToCloudAsync(AudioProcessor processor, string fileName, CancellationToken cancellationToken)
         {
-            await using var memoryStream = new MemoryStream();
-            await processor.CopyToAsync(memoryStream, cancellationToken);
-            memoryStream.Position = 0;
+            //await using var memoryStream = new MemoryStream();
+            //await processor.CopyToAsync(memoryStream, cancellationToken);
+            //memoryStream.Position = 0;
+            using var uploadStream = await processor.GetStreamForCloudUpload(cancellationToken);
 
             await _storageClient.UploadObjectAsync(
-                bucketName,
+                _bucketName,
                 fileName,
                 "audio/mpeg",
-                memoryStream,
+                uploadStream,
                 cancellationToken: cancellationToken);
         }
 
-        private async Task StoreMetadataAsync(Guid id, string text, string localPath, string bucketName, string fileName, CancellationToken cancellationToken)
+        private async Task StoreMetadataAsync(Guid id, string text, string localPath, string fileName, CancellationToken cancellationToken)
         {
             var metadata = new AudioMetadata
             {
                 Id = id,
                 Text = text,
                 LocalPath = localPath,
-                GcsPath = $"gs://{bucketName}/{fileName}",
+                GcsPath = $"gs://{_bucketName}/{fileName}",
                 Timestamp = DateTime.UtcNow
             };
 
-            await _redisDb.StringSetAsync(
-                $"tts:{id}",
-                JsonSerializer.Serialize(metadata),
-                flags: CommandFlags.FireAndForget);
+            await _cache!.SetAsync<AudioMetadata>($"tts:{id}", metadata, TimeSpan.FromHours(1));
+                //.StringSetAsync(
+                //$"tts:{id}",
+                //JsonSerializer.Serialize(metadata),
+                //flags: CommandFlags.FireAndForget);
         }
         public async Task<string> MergeContentsAsync(
             IEnumerable<string> audioFiles,
@@ -332,16 +394,7 @@ namespace MyTts.Data
                 return false;
             }
         }
-         public async Task<List<string>> FetchContentsFromExternalServiceAsync()
-        {
-            // TODO: Implement actual content fetching logic
-            return await Task.FromResult(new List<string>
-               {
-                   "Hello world!",
-                   "This is an async TTS demo using ElevenLabs and .NET.",
-                   "Saving audio to local disk and Google Cloud Storage."
-               });
-        }
+        
         private record FFprobeOutput
         {
             public List<StreamInfo>? Streams { get; init; }
@@ -359,6 +412,23 @@ namespace MyTts.Data
             public required string LocalPath { get; init; }
             public required string GcsPath { get; init; }
             public required DateTime Timestamp { get; init; }
+        }
+        // Update the DisposeAsync method to use Dispose instead of DisposeAsync for StorageClient
+        public async ValueTask DisposeAsync()
+        {
+            try
+            {
+                if (_storageClient != null)
+                {
+                    // StorageClient does not support DisposeAsync, so use Dispose
+                    await Task.Run(() => _storageClient.Dispose());
+                }
+                _semaphore?.Dispose();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error disposing TtsManager resources");
+            }
         }
         /*
         private async Task ProcessContentAsync(string text, Guid id, string bucketName, CancellationToken cancellationToken)

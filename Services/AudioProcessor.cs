@@ -20,6 +20,20 @@ namespace MyTts.Data
             await _voiceClip.CopyToAsync(destination, 81920, cancellationToken);
         }
 
+        // New method specifically for cloud storage uploads
+        public async Task<Stream> GetStreamForCloudUpload(CancellationToken cancellationToken = default)
+        {
+            await _semaphore.WaitAsync(cancellationToken);
+            try
+            {
+                _voiceClip.Position = 0;
+                return _voiceClip;
+            }
+            finally
+            {
+                _semaphore.Release();
+            }
+        }
         public async ValueTask DisposeAsync()
         {
             if (!_disposed)

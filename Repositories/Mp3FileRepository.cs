@@ -3,6 +3,7 @@ using Microsoft.Extensions.Caching.Memory;
 using System.Threading;
 using Newtonsoft.Json;
 using MyTts.Models;
+using MyTts.Services;
 
 namespace MyTts.Repositories
 {
@@ -11,7 +12,7 @@ namespace MyTts.Repositories
         private readonly ILogger<Mp3FileRepository> _logger;
         private readonly string _baseStoragePath;
         private readonly string _metadataPath;
-        private readonly IMemoryCache _cache;
+        private readonly IRedisCacheService _cache;
         private readonly SemaphoreSlim _dbLock;
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _fileLocks;
         private readonly JsonSerializerSettings _jsonSettings;
@@ -25,7 +26,7 @@ namespace MyTts.Repositories
         public Mp3FileRepository(
             ILogger<Mp3FileRepository> logger,
             IConfiguration configuration,
-            IMemoryCache cache)
+            IRedisCacheService cache)
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _cache = cache ?? throw new ArgumentNullException(nameof(cache));
@@ -43,53 +44,60 @@ namespace MyTts.Repositories
             InitializeDirectoriesAsync().GetAwaiter().GetResult();
         }
 
+        public async Task<bool> Mp3FileExistsInCacheAsync(string cacheKey)
+        {
+            ArgumentNullException.ThrowIfNull(cacheKey);
+            try
+            {
+                var existsInCache = await _cache.GetAsync<bool?>(cacheKey);
+                return existsInCache.Value;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error checking file existence at {CacheKey}", cacheKey);
+                throw;
+            }
+        }
+        public async Task<bool> Mp3FileExistsAsync(string filePath)
+        {
+            string fullPath = Path.Combine(_baseStoragePath, filePath);
+            bool exists = await Task.Run(() => File.Exists(fullPath));
+            if(exists) await _cache.SetAsync(fullPath, exists, TimeSpan.FromMinutes(24 * 60));
+            return exists;
+        }
+        /// <summary>
+        /// Loads an MP3 file from the specified path. If the file is not found, it returns an empty byte array.
+        /// </summary>
+        /// <param name="filePath"></param>
+        /// <returns></returns>
         public async Task<byte[]> LoadMp3FileAsync(string filePath)
         {
             ArgumentNullException.ThrowIfNull(filePath);
 
             string cacheKey = $"{FILE_CACHE_KEY_PREFIX}{filePath}";
-            if (_cache.TryGetValue(cacheKey, out byte[]? cachedData))
+            if (await Mp3FileExistsInCacheAsync(cacheKey) || await Mp3FileExistsAsync(filePath))
             {
                 _logger.LogDebug("Cache hit for file: {FilePath}", filePath);
-                return cachedData!;
-            }
 
-            var fileLock = await GetFileLockAsync(filePath);
-            await fileLock.WaitAsync();
-            try
-            {
-                // Double check after acquiring lock
-                if (_cache.TryGetValue(cacheKey, out cachedData))
+                var fileLock = await GetFileLockAsync(filePath);
+                await fileLock.WaitAsync();
+                try
                 {
-                    return cachedData!;
+                    string fullPath = GetFullPath(filePath);
+                    var fileData = await File.ReadAllBytesAsync(fullPath);
+                    return fileData;
                 }
-
-                string fullPath = GetFullPath(filePath);
-                if (!File.Exists(fullPath))
+                catch (Exception ex)
                 {
-                    throw new FileNotFoundException($"MP3 file not found: {filePath}");
+                    _logger.LogError(ex, "Failed to get MP3 file: {FilePath}", filePath);
+                    throw;
                 }
-
-                var fileData = await File.ReadAllBytesAsync(fullPath);
-                var cacheOptions = new MemoryCacheEntryOptions()
-                    .SetSlidingExpiration(FILE_CACHE_DURATION)
-                    .RegisterPostEvictionCallback((key, value, reason, state) =>
-                    {
-                        _logger.LogDebug("Cache entry evicted for key: {Key}, reason: {Reason}", key, reason);
-                    });
-
-                _cache.Set(cacheKey, fileData, cacheOptions);
-                return fileData;
+                finally
+                {
+                    fileLock.Release();
+                }
             }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to get MP3 file: {FilePath}", filePath);
-                throw;
-            }
-            finally
-            {
-                fileLock.Release();
-            }
+            return Array.Empty<byte>();
         }
 
         public async Task SaveMp3FileAsync(string filePath, byte[] fileData)
@@ -119,7 +127,7 @@ namespace MyTts.Repositories
 
                 // Update cache
                 string cacheKey = $"{FILE_CACHE_KEY_PREFIX}{filePath}";
-                _cache.Set(cacheKey, fileData, FILE_CACHE_DURATION);
+                await _cache.SetAsync(cacheKey, fileData, FILE_CACHE_DURATION);
             }
             catch (Exception ex)
             {
@@ -145,7 +153,7 @@ namespace MyTts.Repositories
                 {
                     File.Delete(fullPath);
                     string cacheKey = $"{FILE_CACHE_KEY_PREFIX}{filePath}";
-                    _cache.Remove(cacheKey);
+                    await _cache.RemoveAsync(cacheKey);
                 }
             }
             catch (Exception ex)
@@ -164,35 +172,42 @@ namespace MyTts.Repositories
             return Task.FromResult(_fileLocks.GetOrAdd(filePath, _ => new SemaphoreSlim(1, 1)));
         }
 
-        public async Task<List<Mp3File>> LoadMp3MetadatasAsync()
+        public async Task<List<Mp3File>> LoadListMp3MetadatasAsync()
         {
             // Try get from cache first
-            if (_cache.TryGetValue(DB_CACHE_KEY, out List<Mp3File>? cachedFiles))
+            var cachedData = await _cache.GetAsync<List<Mp3File>>(DB_CACHE_KEY);
+            if (cachedData != null)
             {
-                return cachedFiles ?? new List<Mp3File>();
+                _logger.LogDebug("Cache hit for MP3 metadata database");
+                return cachedData;
             }
 
             await _dbLock.WaitAsync();
             try
             {
-                // Double check after acquiring lock
-                if (_cache.TryGetValue(DB_CACHE_KEY, out cachedFiles))
+                // Double-check cache after acquiring lock
+                cachedData = await _cache.GetAsync<List<Mp3File>>(DB_CACHE_KEY);
+                if (cachedData != null)
                 {
-                    return cachedFiles ?? new List<Mp3File>();
+                    return cachedData;
                 }
 
+                // Load from file if not in cache
                 if (!File.Exists(_metadataPath))
                 {
                     var emptyList = new List<Mp3File>();
-                    _cache.Set(DB_CACHE_KEY, emptyList, DB_CACHE_DURATION);
+                    await _cache.SetAsync(DB_CACHE_KEY, emptyList, DB_CACHE_DURATION);
                     return emptyList;
                 }
 
                 var json = await File.ReadAllTextAsync(_metadataPath);
-                var mp3Files = Newtonsoft.Json.JsonConvert.DeserializeObject<List<Mp3File>>(json)
+                var mp3Files = JsonConvert.DeserializeObject<List<Mp3File>>(json, _jsonSettings)
                     ?? new List<Mp3File>();
 
-                _cache.Set(DB_CACHE_KEY, mp3Files, DB_CACHE_DURATION);
+                // Cache the loaded data
+                await _cache.SetAsync(DB_CACHE_KEY, mp3Files, DB_CACHE_DURATION);
+
+                _logger.LogDebug("Loaded {Count} MP3 files from database", mp3Files.Count);
                 return mp3Files;
             }
             catch (Exception ex)
@@ -224,7 +239,7 @@ namespace MyTts.Repositories
                 File.Move(tempPath, _metadataPath);
 
                 // Update cache
-                _cache.Set(DB_CACHE_KEY, mp3Files, DB_CACHE_DURATION);
+                await _cache.SetAsync(DB_CACHE_KEY, mp3Files, DB_CACHE_DURATION);
             }
             catch (Exception ex)
             {
@@ -303,16 +318,11 @@ namespace MyTts.Repositories
         {
             return Path.Combine(_baseStoragePath, filePath);
         }
-        public async Task<bool> Mp3FileExistsAsync(string basePath, string filePath)
-        {
-            string fullPath = Path.Combine(_baseStoragePath, basePath, filePath);
-            return await Task.Run(() => File.Exists(fullPath));
-        }
         public async Task<Mp3File> LoadMp3MetaByPathAsync(string filePath)
         {
             try
             {
-                var mp3Files = await LoadMp3MetadatasAsync();
+                var mp3Files = await LoadListMp3MetadatasAsync();
                 return mp3Files.FirstOrDefault(f => f.FilePath == filePath)
                     ?? throw new FileNotFoundException($"MP3 file not found: {filePath}");
             }
@@ -328,16 +338,12 @@ namespace MyTts.Repositories
         #region Database Operations
         public async Task<Mp3File> LoadMp3MetaByNewsIdAsync(string id)
         {
-            try
+            // Check cache first for metadata
+            string metaCacheKey = $"mp3meta:{id}";
+            var mp3File = await _cache.GetAsync<Mp3File>(metaCacheKey);
+            if (mp3File == null)
             {
-                var mp3Files = await LoadMp3MetadatasAsync();
-                return mp3Files.FirstOrDefault(f => f.NewsIds == id)
-                    ?? throw new KeyNotFoundException($"No MP3 file found with News ID: {id}");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to get MP3 file by news ID: {Id}", id);
-                throw;
+                
             }
         }
 
@@ -345,7 +351,7 @@ namespace MyTts.Repositories
         {
             try
             {
-                var mp3Files = await LoadMp3MetadatasAsync();
+                var mp3Files = await LoadListMp3MetadatasAsync();
                 return mp3Files
                     .Where(f => f.Language.Equals(language, StringComparison.OrdinalIgnoreCase))
                     .OrderByDescending(f => f.CreatedDate)
@@ -363,7 +369,7 @@ namespace MyTts.Repositories
         {
             try
             {
-                var mp3Files = await LoadMp3MetadatasAsync();
+                var mp3Files = await LoadListMp3MetadatasAsync();
                 mp3Files.Add(mp3File);
                 await SaveMp3MetadatasAsync(mp3Files);
             }
@@ -373,40 +379,25 @@ namespace MyTts.Repositories
                 throw;
             }
         }
-
-        // public async Task SaveMp3FilesAsync(List<Mp3File> mp3Files)
-        // {
-        //     try
-        //     {
-        //         var json = Newtonsoft.Json.JsonConvert.SerializeObject(mp3Files, Newtonsoft.Json.Formatting.Indented);
-        //         await File.WriteAllTextAsync(_dbPath, json);
-        //     }
-        //     catch (Exception ex)
-        //     {
-        //         _logger.LogError(ex, "Failed to save MP3 files database");
-        //         throw;
-        //     }
-        // }
-
-        // public async Task<List<Mp3File>> LoadMp3FilesAsync()
-        // {
-        //     if (!File.Exists(_dbPath))
-        //     {
-        //         return new List<Mp3File>();
-        //     }
-
-        //     try
-        //     {
-        //         var json = await File.ReadAllTextAsync(_dbPath);
-        //         return Newtonsoft.Json.JsonConvert.DeserializeObject<List<Mp3File>>(json)
-        //             ?? new List<Mp3File>();
-        //     }
-        //     catch (Exception ex)
-        //     {
-        //         _logger.LogError(ex, "Failed to load MP3 files database");
-        //         throw;
-        //     }
-        // }
+        public async Task<Mp3File?> LoadAndCacheMp3File(string id)
+        {
+            var mp3File = await LoadMp3MetaByNewsIdAsync(id);
+            if (mp3File != null)
+            {
+                await SetToCacheAsync($"mp3meta:{id}", mp3File, TimeSpan.FromHours(1));
+            }
+            return mp3File;
+        }
+        public async Task<T?> GetFromCacheAsync<T>(string key) where T : class
+        {
+            ArgumentNullException.ThrowIfNull(_cache);
+            return await _cache.GetAsync<T>(key);
+        }
+        public async Task SetToCacheAsync<T>(string key, T value, TimeSpan? expiry = null)
+        {
+            ArgumentNullException.ThrowIfNull(_cache);
+            await _cache.SetAsync(key, value, expiry);
+        }
 
         #endregion
 

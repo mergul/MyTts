@@ -43,6 +43,7 @@ namespace MyTts.Controllers
                 await Results.Problem("Failed to process MP3 request").ExecuteAsync(HttpContext);
             }
         }
+        //Works Fine
         public async Task List(ListRequest request)
         {
             try
@@ -96,5 +97,57 @@ namespace MyTts.Controllers
                 await Results.Problem("Failed to retrieve last MP3").ExecuteAsync(HttpContext);
             }
         }
+        public async Task<IActionResult> GetMp3FileById(string id, CancellationToken cancellationToken)
+        {
+            try
+            {
+                var file = await _mp3Service.DownloadMp3(id, cancellationToken);
+                if (file == null)
+                {
+                    return NotFound();
+                }
+                return Ok(file);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error retrieving MP3 file with ID {Id}", id);
+                return Problem("Failed to retrieve MP3 file");
+            }
+        }
+        public async Task<IActionResult> GetMp3FileListByLanguage(string id, CancellationToken cancellationToken)
+        {
+            try
+            {
+                var file = await _mp3Service.StreamMp3(id, cancellationToken);
+                if (file == null)
+                {
+                    return NotFound();
+                }
+                return Ok(file);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error retrieving MP3 file with ID {Id}", id);
+                return Problem("Failed to retrieve MP3 file");
+            }
+        }
+        //public async Task Delete(string id)
+        //{
+        //    try
+        //    {
+        //        var file = await _mp3Service.GetMp3FileAsync(id);
+        //        if (file == null)
+        //        {
+        //            await Results.NotFound().ExecuteAsync(HttpContext);
+        //            return;
+        //        }
+        //        await _mp3Service.DeleteMp3FileAsync(file);
+        //        await Results.Ok().ExecuteAsync(HttpContext);
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        _logger.LogError(ex, "Error deleting MP3 file with ID {Id}", id);
+        //        await Results.Problem("Failed to delete MP3 file").ExecuteAsync(HttpContext);
+        //    }
     }
 }

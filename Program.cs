@@ -12,6 +12,8 @@ using MyTts.Data.Interfaces;
 using MyTts.Data.Entities;
 using MyTts.Data.Repositories;
 using MyTts.Controllers;
+using MyTts.Storage;
+using MyTts.Data;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -47,13 +49,13 @@ static void ConfigureEndpoints(WebApplication app)
 }
 static void ConfigureServices(IServiceCollection services, IConfiguration configuration)
 {
-services
-    .AddCoreServices(configuration)
-    .AddStorageServices(configuration)
-    .AddElevenLabsServices(configuration)
-    .AddRedisServices(configuration)
-    .AddHttpClients()
-    .AddApiServices();
+    services
+        .AddCoreServices(configuration)
+        .AddStorageServices(configuration)
+        .AddElevenLabsServices(configuration)
+        .AddRedisServices(configuration)
+        .AddHttpClients()
+        .AddApiServices();
 }
 
 public static class ServiceCollectionExtensions
@@ -69,7 +71,6 @@ public static class ServiceCollectionExtensions
         services.AddScoped<IMp3Service, Mp3Service>();
         services.AddScoped<IMp3FileRepository, Mp3FileRepository>();
         services.AddScoped<NewsFeedsService>();
-
         services.AddLogging(logging =>
         {
             logging.AddConsole();
@@ -81,6 +82,16 @@ public static class ServiceCollectionExtensions
 
     public static IServiceCollection AddStorageServices(this IServiceCollection services, IConfiguration configuration)
     {
+
+        services.AddOptions<StorageConfiguration>()
+        .Bind(configuration.GetSection("Storage"))
+        .ValidateDataAnnotations()
+        .ValidateOnStart();
+
+        // Register TtsManager as a singleton with disposal
+        services.AddSingleton<TtsManager>();
+        services.AddHostedService<IHostedService>(sp =>
+            new HostedServiceWrapper(sp.GetRequiredService<TtsManager>()));
         return services;
     }
 

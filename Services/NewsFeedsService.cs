@@ -25,6 +25,16 @@ namespace MyTts.Services
             // Replace with logic to fetch the feed URL from configuration
             return $"https://example.com/feed/{language}";
         }
+        public async Task<List<string>> FetchContentsFromExternalServiceAsync(string language, int limit)
+        {
+            // TODO: Implement actual content fetching logic
+            return await Task.FromResult(new List<string>
+               {
+                   "Hello world!",
+                   "This is an async TTS demo using ElevenLabs and .NET.",
+                   "Saving audio to local disk and Google Cloud Storage."
+               });
+        }
         private async Task<List<FeedItem>> FetchFeedDataAsync(string url)
         {
             using var feedClient = _clientFactory.CreateClient("FeedClientName");
@@ -58,14 +68,15 @@ namespace MyTts.Services
             })
             .ToList();
 
-        // public async Task<Dictionary<string, object>> GetFeedByLanguageAsync(string language, int limit)
-        // {
-        //     var feedUrl = GetFeedUrl(language);
-        //     var feedData = await FetchFeedDataAsync(feedUrl).ConfigureAwait(false);
-        //     var processedData = ProcessFeedData(feedData, limit);
+        public async Task<List<string>> GetFeedByLanguageAsync(string language, int limit)
+        {
+            var feedUrl = GetFeedUrl(language);
+            var feedData = await FetchFeedDataAsync(feedUrl).ConfigureAwait(false);
+            var processedData = ProcessFeedData(feedData, limit);
+            return processedData.Select(item => item["Content"].ToString()).ToList();
 
-        //     return await ConvertToMp3Async<Dictionary<string, object>>(processedData, language).ConfigureAwait(false);
-        // }
+            // return await ConvertToMp3Async<Dictionary<string, object>>(processedData, language).ConfigureAwait(false);
+        }
     }
     public record FeedItem
     {
