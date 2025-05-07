@@ -1,15 +1,17 @@
-using System;
+﻿using System;
 using System.ComponentModel.DataAnnotations;
 using System.ComponentModel.DataAnnotations.Schema;
+using MyTts.Data.Entities;
+using MyTts.Data.Interfaces;
 
-namespace MyTts.Data.Entities
+namespace MyTts.Models
 {
     [Table("Haberler_Speeches")]
     public class Mp3Meta : BaseEntity, IMp3
     {
         [Key]
         [DatabaseGenerated(DatabaseGeneratedOption.Identity)]
-        public int Id { get; set; }
+        new public int Id { get; set; }
         [Column("FileName")]
         public required string FileName { get; set; }
         [Column("Title")]
@@ -32,8 +34,7 @@ namespace MyTts.Data.Entities
         public required string Language { get; set; }
 
         [Column("Created_Date")]
-        public DateTime? CreatedDate { get; set; }
+        new public DateTime? CreatedDate { get; set; }
 
-        // Add other properties as needed, based on your database schema
     }
 }

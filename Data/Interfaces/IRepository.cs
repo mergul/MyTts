@@ -1,16 +1,22 @@
 using System.Collections.Generic;
 using System.Threading.Tasks;
+using MyTts.Data.Entities;
+using MyTts.Data.Interfaces;
 
 namespace MyTts.Data.Interfaces
 {
-    public interface IRepository<T> where T : class
+    public interface IRepository<TEntity, TModel> 
+    
+    where TEntity : BaseEntity 
+    where TModel : class, IModel
     {
-        Task<IEnumerable<T>> GetAllAsync();
-        Task<T> GetByIdAsync(int id);
-        Task AddAsync(T entity);
-        void Update(T entity);
-        void Delete(T entity);
+        Task<TEntity> GetByIdAsync(int id);
+        Task<IEnumerable<TEntity>> GetAllAsync();
+        Task AddAsync(TEntity entity);
         Task SaveChangesAsync();
-        Task<IEnumerable<T>> FindAsync(Func<T, bool> predicate);
+        Task<IEnumerable<TEntity>> FindAsync(Func<TEntity, bool> predicate);
+        void Update(TEntity entity);
+        void Delete(TEntity entity);
     }
+    
 }

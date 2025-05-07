@@ -4,11 +4,11 @@ using System.ComponentModel.DataAnnotations.Schema;
 namespace MyTts.Data.Entities
 {
     [Table("News")]
-    public class News
+    public class News : BaseEntity
     {
         [Key]
         [DatabaseGenerated(DatabaseGeneratedOption.Identity)]
-        public int Id { get; set; }
+        public new int Id { get; set; }
 
         [Column("haberId")]
         public int? HaberId { get; set; }

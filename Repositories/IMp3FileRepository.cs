@@ -1,5 +1,5 @@
 
-using MyTts.Models;
+using MyTts.Data.Interfaces;
 
 namespace MyTts.Repositories
 {
@@ -7,16 +7,16 @@ namespace MyTts.Repositories
     {
         Task<byte[]> LoadMp3FileAsync(string filePath);
         Task SaveMp3FileAsync(string filePath, byte[] fileData);
-        Task<List<Mp3File>> LoadListMp3MetadatasAsync();
-        Task SaveMp3MetadatasAsync(List<Mp3File> mp3Files);
+        Task<List<IMp3>> LoadListMp3MetadatasAsync();
+        Task SaveMp3MetadatasAsync(List<IMp3> mp3Files);
         Task DeleteMp3FileAsync(string filePath);
         Task<bool> Mp3FileExistsAsync(string filePath);
-        Task<Mp3File> LoadMp3MetaByPathAsync(string filePath);
-        Task<Mp3File> LoadMp3MetaByNewsIdAsync(string id);
-        Task<Mp3File> LoadLatestMp3MetaByLanguageAsync(string language);
-        Task SaveSingleMp3MetaAsync(Mp3File mp3File);
-        Task<Mp3File?> LoadAndCacheMp3File(string id);
-        Task<T?> GetFromCacheAsync<T>(string key) where T : class;
-        Task SetToCacheAsync<T>(string key, T value, TimeSpan? expiry = null);
+        Task<IMp3> LoadMp3MetaByPathAsync(string filePath);
+        Task<Data.Interfaces.IMp3> LoadMp3MetaByNewsIdAsync<IMp3>(string id);
+        Task<IMp3> LoadLatestMp3MetaByLanguageAsync(string language);
+        Task SaveSingleMp3MetaAsync(IMp3 mp3File);
+        Task<Data.Interfaces.IMp3?> LoadAndCacheMp3File<IMp3>(string id) ;
+        Task<IMp3?> GetFromCacheAsync<IMp3>(string key) ;
+        Task SetToCacheAsync<IMp3>(string key, IMp3 value, TimeSpan? expiry = null);
     }
 }

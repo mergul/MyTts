@@ -2,6 +2,7 @@ using MyTts.Data;
 using MyTts.Models;
 using MyTts.Repositories;
 using Microsoft.AspNetCore.Mvc;
+using MyTts.Data.Interfaces;
 
 namespace MyTts.Services
 {
@@ -13,46 +14,68 @@ namespace MyTts.Services
         private readonly NewsFeedsService _newsFeedsService;
         private readonly IRedisCacheService? _cache;
         private const string AudioBasePath = "audio";
+        private readonly SemaphoreSlim _processingSemaphore;
+        private const int MaxConcurrentProcessing = 3;
+        private bool _disposed;
+
         public Mp3Service(
             ILogger<Mp3Service> logger,
+            IMp3FileRepository mp3FileRepository,
             TtsManager ttsManager,
             IRedisCacheService _cache,
             NewsFeedsService newsFeedsService)
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _mp3FileRepository = mp3FileRepository ?? throw new ArgumentNullException(nameof(mp3FileRepository));
             _ttsManager = ttsManager ?? throw new ArgumentNullException(nameof(ttsManager));
             _cache = _cache ?? throw new ArgumentNullException(nameof(_cache));
             _newsFeedsService = newsFeedsService ?? throw new ArgumentNullException(nameof(newsFeedsService));
+            _processingSemaphore = new SemaphoreSlim(MaxConcurrentProcessing);
         }
-        public async Task<string?> CreateMultipleMp3Async(ListRequest listRequest)
+        public async Task<string> CreateMultipleMp3Async(string language, int limit, CancellationToken cancellationToken)
         {
-            List<string> contents = await _newsFeedsService.GetFeedByLanguageAsync("listRequestUrl", 20);
-            return await _ttsManager.ProcessContentsAsync(contents);
-        }
-        public async Task<Mp3File> CreateSingleMp3Async(OneRequest request)
-        {
-            throw new NotImplementedException("This method is not implemented yet.");
-        }
-        public async Task<IEnumerable<Mp3File>> GetFeedByLanguageAsync(string language, int limit)
-        {
-            if (_cache == null)
+            try
             {
-                throw new InvalidOperationException("Cache service is not initialized.");
+                await _processingSemaphore.WaitAsync();
+                var contents = await _newsFeedsService.GetFeedByLanguageAsync(language, limit);
+                return await _ttsManager.ProcessContentsAsync(contents) ?? string.Empty;
             }
-
-            var result = await _cache.GetAsync<IEnumerable<Mp3File>>($"feed_{language}_{limit}");
-            return result ?? Enumerable.Empty<Mp3File>();
-        }
-        public async Task<Mp3File> GetMp3FileAsync(string id)
+            finally
+            {
+                _processingSemaphore.Release();
+            }
+      }
+        public async Task<IMp3> CreateSingleMp3Async(OneRequest request, CancellationToken cancellationToken)
         {
-            if (string.IsNullOrEmpty(id)) throw new ArgumentNullException(nameof(id));
-            return await _mp3FileRepository.LoadMp3MetaByNewsIdAsync(id)
+            try
+            {
+                await _processingSemaphore.WaitAsync();
+                var content = await _newsFeedsService.GetFeedUrl(request.News);
+                var filePath = await _ttsManager.ProcessContentAsync(content, Guid.NewGuid(), cancellationToken);
+                return await _mp3FileRepository.LoadMp3MetaByPathAsync(filePath);
+            }
+            finally
+            {
+                _processingSemaphore.Release();
+            }
+        }
+        public async Task<IEnumerable<IMp3>> GetFeedByLanguageAsync(ListRequest listRequest, CancellationToken cancellationToken)
+        {
+            var cacheKey = $"feed_{listRequest.Language}";
+            return _cache != null 
+                ? await _cache.GetAsync<IEnumerable<IMp3>>(cacheKey) ?? Enumerable.Empty<IMp3>()
+                : Enumerable.Empty<IMp3>();
+        }
+        public async Task<IMp3> GetMp3FileAsync(string id, CancellationToken cancellationToken)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(id);
+            return await _mp3FileRepository.LoadMp3MetaByNewsIdAsync<IMp3>(id)
                 ?? throw new KeyNotFoundException($"MP3 file not found for ID: {id}");
         }
 
-        public async Task<Mp3File> GetLastMp3ByLanguageAsync(string language)
+        public async Task<IMp3> GetLastMp3ByLanguageAsync(string language, CancellationToken cancellationToken)
         {
-            if (string.IsNullOrEmpty(language)) throw new ArgumentNullException(nameof(language));
+            ArgumentException.ThrowIfNullOrEmpty(language);
             return await _mp3FileRepository.LoadLatestMp3MetaByLanguageAsync(language);
         }
         // Fix FileStream properties in all methods
@@ -95,11 +118,7 @@ namespace MyTts.Services
         }
         private ObjectResult CreateErrorResponse(Exception ex, string message)
         {
-            return new ObjectResult(new
-            {
-                message = message,
-                error = ex.Message
-            })
+            return new ObjectResult(new { message, error = ex.Message })
             {
                 StatusCode = 500
             };
@@ -124,8 +143,8 @@ namespace MyTts.Services
         {
             try
             {
-                var mp3File = await _mp3FileRepository.GetFromCacheAsync<Mp3File>($"mp3stream:{id}")
-                    ?? await _mp3FileRepository.LoadAndCacheMp3File(id);
+                var mp3File = await _mp3FileRepository.GetFromCacheAsync<IMp3>($"mp3stream:{id}")
+                    ?? await _mp3FileRepository.LoadAndCacheMp3File<IMp3>(id);
 
                 if (mp3File == null)
                 {
@@ -152,6 +171,46 @@ namespace MyTts.Services
                 return CreateErrorResponse(ex, "An error occurred while streaming the audio.");
             }
         }
+        private async Task<IMp3?> GetOrLoadMp3File(string id)
+        {
+            var cacheKey = $"mp3stream:{id}";
+            return await _mp3FileRepository.GetFromCacheAsync<IMp3>(cacheKey)
+                ?? await _mp3FileRepository.LoadAndCacheMp3File<IMp3>(id);
+        }
+        private async Task<(byte[] FileData, string LocalPath)> GetOrProcessMp3File(string id, CancellationToken cancellationToken)
+        {
+            var fileData = await _mp3FileRepository.LoadMp3FileAsync(id);
+            var localPath = id;
+
+            if (fileData == null || fileData.Length == 0)
+            {
+                var content = _newsFeedsService.GetFeedUrl(id);
+                localPath = await _ttsManager.ProcessContentAsync(content, Guid.NewGuid(), cancellationToken);
+                fileData = await _mp3FileRepository.LoadMp3FileAsync(localPath);
+            }
+
+            return (fileData, localPath);
+        }
+
+        private IActionResult CreateStreamResponse(string filePath, string fileName)
+        {
+            var stream = CreateFileStream(filePath, isStreaming: true);
+            var headers = CreateStandardHeaders(fileName);
+            return CreateFileStreamResponse(stream, fileName, headers);
+        }
+
+        private IActionResult CreateDownloadResponse(byte[] fileData, string localPath)
+        {
+            return new FileContentResult(fileData, "audio/mpeg")
+            {
+                FileDownloadName = Path.GetFileName(localPath),
+                EnableRangeProcessing = true
+            };
+        }
+        private NotFoundObjectResult CreateNotFoundResponse(string message)
+        {
+            return new NotFoundObjectResult(new { message });
+        }
         /// <summary>
         /// Download MP3 file by ID, if not found, process the content and save it.
         /// </summary>
@@ -162,52 +221,65 @@ namespace MyTts.Services
         {
             try
             {
-                string localPath=""+id;
-                byte[] fileData;
-                fileData = await _mp3FileRepository.LoadMp3FileAsync(id);
-                if (fileData == null || fileData.Length == 0)
-                {
-                    var content =  _newsFeedsService.GetFeedUrl("id");
-                    localPath = await _ttsManager.ProcessContentAsync(content, Guid.NewGuid(), cancellationToken).ConfigureAwait(false);
-                    fileData = await _mp3FileRepository.LoadMp3FileAsync(localPath);
-
-                }
-                // Set response headers
-                var headers = new Dictionary<string, string>
-                {
-                    { "Content-Disposition", $"attachment; filename=\"{Path.GetFileName(localPath)}\"" },
-                    { "Cache-Control", "public, max-age=3600" },
-                    { "Accept-Ranges", "bytes" }
-                };
-
-                // Return file result with proper headers
-                return new FileContentResult(fileData, "audio/mpeg")
-                {
-                    FileDownloadName = Path.GetFileName(localPath),
-                    EnableRangeProcessing = true
-                };
-
+                var (fileData, localPath) = await GetOrProcessMp3File(id, cancellationToken);
+                return CreateDownloadResponse(fileData, localPath);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error processing MP3 download for ID: {Id}", id);
-                return new ObjectResult(new
-                {
-                    message = "An error occurred while processing the request.",
-                    error = ex.Message
-                })
-                {
-                    StatusCode = 500
-                };
+                return CreateErrorResponse(ex, "An error occurred while processing the request.");
             }
         }
+        // public async Task<IActionResult> DownloadMp3(string id, CancellationToken cancellationToken)
+        // {
+        //     try
+        //     {
+        //         string localPath=""+id;
+        //         byte[] fileData;
+        //         fileData = await _mp3FileRepository.LoadMp3FileAsync(id);
+        //         if (fileData == null || fileData.Length == 0)
+        //         {
+        //             var content =  _newsFeedsService.GetFeedUrl("id");
+        //             localPath = await _ttsManager.ProcessContentAsync(content, Guid.NewGuid(), cancellationToken).ConfigureAwait(false);
+        //             fileData = await _mp3FileRepository.LoadMp3FileAsync(localPath);
+
+        //         }
+        //         // Set response headers
+        //         var headers = new Dictionary<string, string>
+        //         {
+        //             { "Content-Disposition", $"attachment; filename=\"{Path.GetFileName(localPath)}\"" },
+        //             { "Cache-Control", "public, max-age=3600" },
+        //             { "Accept-Ranges", "bytes" }
+        //         };
+
+        //         // Return file result with proper headers
+        //         return new FileContentResult(fileData, "audio/mpeg")
+        //         {
+        //             FileDownloadName = Path.GetFileName(localPath),
+        //             EnableRangeProcessing = true
+        //         };
+
+        //     }
+        //     catch (Exception ex)
+        //     {
+        //         _logger.LogError(ex, "Error processing MP3 download for ID: {Id}", id);
+        //         return new ObjectResult(new
+        //         {
+        //             message = "An error occurred while processing the request.",
+        //             error = ex.Message
+        //         })
+        //         {
+        //             StatusCode = 500
+        //         };
+        //     }
+        // }
         public async Task<IActionResult> DownloadMp3FromDisk(string id, CancellationToken cancellationToken = default)
         {
             try
             {
                 // Check cache first
                 string cacheKey = $"mp3disk:{id}";
-                var cachedPath = await _cache.GetAsync<string>(cacheKey);
+                var cachedPath = _cache != null ? await _cache.GetAsync<string>(cacheKey) : null;
 
                 string filePath;
                 if (cachedPath != null)
@@ -217,7 +289,7 @@ namespace MyTts.Services
                 else
                 {
                     // Get file metadata from repository
-                    var mp3File = await _mp3FileRepository.LoadMp3MetaByNewsIdAsync(id);
+                    var mp3File = await _mp3FileRepository.LoadMp3MetaByNewsIdAsync<IMp3>(id);
                     if (mp3File == null)
                     {
                         _logger.LogWarning("MP3 file metadata not found for ID: {Id}", id);
@@ -227,7 +299,7 @@ namespace MyTts.Services
                     filePath = Path.Combine(TtsManager.LocalSavePath, mp3File.FileName);
 
                     // Cache the path for future requests
-                    await _cache.SetAsync(cacheKey, filePath, TimeSpan.FromHours(1));
+                    await _cache!.SetAsync(cacheKey, filePath, TimeSpan.FromHours(1));
                 }
 
                 // Check if file exists
@@ -285,6 +357,27 @@ namespace MyTts.Services
                 { "X-Content-Type-Options", "nosniff" }
             };
         }
+        public async ValueTask DisposeAsync()
+        {
+            if (!_disposed)
+            {
+                _processingSemaphore.Dispose();
+                _disposed = true;
+            }
+            await Task.CompletedTask;
+        }
 
+        public async Task<IEnumerable<IMp3>> GetMp3FileListAsync(CancellationToken cancellationToken)
+        {
+            // return await _mp3FileRepository.LoadAllMp3MetaAsync();
+            throw new NotImplementedException();
+        }
+
+        public async Task<IEnumerable<IMp3>> GetMp3FileListByLanguageAsync(string language, CancellationToken cancellationToken)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(language);
+            // return await _mp3FileRepository.LoadMp3MetaByLanguageAsync(language);
+            throw new NotImplementedException();
+        }
     }
 }

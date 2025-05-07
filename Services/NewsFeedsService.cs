@@ -73,7 +73,7 @@ namespace MyTts.Services
             var feedUrl = GetFeedUrl(language);
             var feedData = await FetchFeedDataAsync(feedUrl).ConfigureAwait(false);
             var processedData = ProcessFeedData(feedData, limit);
-            return processedData.Select(item => item["Content"].ToString()).ToList();
+            return [.. processedData.Select(item => item["Content"].ToString())];
 
             // return await ConvertToMp3Async<Dictionary<string, object>>(processedData, language).ConfigureAwait(false);
         }

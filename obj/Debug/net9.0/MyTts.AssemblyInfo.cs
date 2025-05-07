@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("MyTts")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+d5e9f65094d78c118ac80ecf1ec5eb5e9eb6d658")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+c3192b941353f3ac0a39294f07f76d060cf2f857")]
 [assembly: System.Reflection.AssemblyProductAttribute("MyTts")]
 [assembly: System.Reflection.AssemblyTitleAttribute("MyTts")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

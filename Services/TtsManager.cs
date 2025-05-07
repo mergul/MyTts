@@ -168,9 +168,14 @@ namespace MyTts.Data
 
                 // Parallel operations for saving and uploading
                 await Task.WhenAll(
+                    // Save locally
                     SaveLocallyAsync(audioProcessor, localPath, cancellationToken),
+                    // Save metadata to SQL
+                    SaveMetadataSqlAsync(id, text, localPath, fileName, cancellationToken),
+                    // Upload to Google Cloud Storage
                     UploadToCloudAsync(audioProcessor, fileName, cancellationToken),
-                    StoreMetadataAsync(id, text, localPath, fileName, cancellationToken)
+                    // Store metadata in Redis
+                    StoreMetadataRedisAsync(id, text, localPath, fileName, cancellationToken)
                 );
 
                 _logger.LogInformation("Processed content {Id}: {FileName}", id, fileName);
@@ -226,7 +231,7 @@ namespace MyTts.Data
                 cancellationToken: cancellationToken);
         }
 
-        private async Task StoreMetadataAsync(Guid id, string text, string localPath, string fileName, CancellationToken cancellationToken)
+        private async Task StoreMetadataRedisAsync(Guid id, string text, string localPath, string fileName, CancellationToken cancellationToken)
         {
             var metadata = new AudioMetadata
             {
@@ -238,11 +243,16 @@ namespace MyTts.Data
             };
 
             await _cache!.SetAsync<AudioMetadata>($"tts:{id}", metadata, TimeSpan.FromHours(1));
-                //.StringSetAsync(
-                //$"tts:{id}",
-                //JsonSerializer.Serialize(metadata),
-                //flags: CommandFlags.FireAndForget);
+                
         }
+
+        private Task SaveMetadataSqlAsync(Guid id, string text, string localPath, string fileName, CancellationToken cancellationToken)
+        {
+            // TODO: Implement database operations
+            
+            return Task.CompletedTask;
+        }
+
         public async Task<string> MergeContentsAsync(
             IEnumerable<string> audioFiles,
             string outputFileName,
